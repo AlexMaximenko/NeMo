@@ -32,7 +32,7 @@ from nemo.collections.nlp.modules.common.transformer import TransformerEncoder
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class TransposeLast(torch.nn.Module):
@@ -51,8 +51,8 @@ class SamePad(torch.nn.Module):
 
     def forward(self, x):
         if self.remove:
-            x = x[:, :, :-1]
-        return x
+            y = x[:, :, :-1]
+        return y
 
 
 class ConvFeatureEncoder(NeuralModule):
@@ -104,7 +104,6 @@ class ConvFeatureEncoder(NeuralModule):
         embedding_dim=768,
     ):
         super().__init__()
-
         self.grad_mult = feature_grad_mult
         self.normalize_input = normalize_audio
 
@@ -130,6 +129,10 @@ class ConvFeatureEncoder(NeuralModule):
                 return nn.Sequential(make_conv(), nn.GELU())
 
         in_d = 1
+
+        # Check if conv_layers is List[List] instead of List[Dict]:
+        if not isinstance(conv_layers[0], DictConfig):
+            conv_layers = self._conv_layers_to_dict(conv_layers)
         self.layer_cfg = conv_layers
         self.conv_layers = nn.ModuleList()
         self.mode = extractor_mode
@@ -201,6 +204,18 @@ class ConvFeatureEncoder(NeuralModule):
         processed_signal_length = self.get_lengths(audio_lengths=length)
 
         return processed_signal, processed_signal_length
+
+    def _conv_layers_to_dict(self, conv_layers):
+        res = []
+        for layer in conv_layers:
+            res.append(
+                {
+                    'emb_dim': layer[0],
+                    'kernel_size': layer[1],
+                    'stride': layer[2]
+                }
+            )
+        return res
 
     def get_lengths(self, audio_lengths):
         # converts audio lengths to timestep lengths
@@ -313,7 +328,7 @@ class Wav2VecTransformerEncoder(TransformerEncoder):
             audio_signal[idx, :, len:] = 0.0
 
         signal_conv = self.pos_conv(audio_signal)  # B, C, T
-        audio_signal += signal_conv
+        audio_signal = audio_signal + signal_conv
 
         audio_signal = audio_signal.transpose(1, 2)  # B, C, T -> B, T, C
         audio_signal = self.layer_norm(audio_signal)
@@ -340,8 +355,8 @@ class Wav2VecTransformerEncoder(TransformerEncoder):
 
     def create_padding_mask(self, length):
         # Broadcast to vectorize creating the padding mask
-        max_len = max(length)
-        padding_mask = torch.arange(max_len, device=DEVICE)
+        max_len = int(max(length))
+        padding_mask = torch.arange(max_len, device=length.device)
 
         # Switch to binary for transformer, 1 for valid tokens, 0 for padding
         padding_mask = (padding_mask.expand(len(length), max_len) < length.unsqueeze(1)).type(torch.uint8)

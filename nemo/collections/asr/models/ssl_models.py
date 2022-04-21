@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from email.mime import audio
 from math import ceil
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, Tuple
+import numpy as np
 
-import torch
+import torch, torch.nn as nn 
 from omegaconf import DictConfig, open_dict
 from pytorch_lightning import Trainer
 
@@ -27,6 +29,11 @@ from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, Spectro
 from nemo.utils import logging
 
 __all__ = ['SpeechEncDecSelfSupervisedModel']
+
+# make padding mask from given lengths
+def make_pad_mask(lengths: torch.Tensor) -> torch.Tensor:
+    return torch.arange(0, lengths.max(), device=lengths.device).view(1, -1).expand(lengths.size(0), -1) >= lengths.view(-1, 1)
+
 
 
 class SpeechEncDecSelfSupervisedModel(ModelPT, ASRModuleMixin):
@@ -65,6 +72,26 @@ class SpeechEncDecSelfSupervisedModel(ModelPT, ASRModuleMixin):
         self.loss = SpeechEncDecSelfSupervisedModel.from_config_dict(self._cfg.loss)
 
         self.spec_augmentation = SpeechEncDecSelfSupervisedModel.from_config_dict(self._cfg.spec_augment)
+
+        # masking
+        if 'masking' in self._cfg:
+            self.mask_prob = self._cfg.masking.mask_prob
+            self.mask_length = self._cfg.masking.mask_length
+            self.mask_selection = self._cfg.masking.mask_selection
+            self.mask_other = self._cfg.masking.mask_other
+            self.no_mask_overlap = self._cfg.masking.no_mask_overlap
+            self.mask_min_space = self._cfg.masking.mask_min_space
+        else:
+            self.mask_prob = 0.65
+            self.mask_length = 10
+            self.mask_selection = 'static'
+            self.mask_other = 0
+            self.no_mask_overlap = False
+            self.mask_min_space = 1
+        
+        self.mask_emb = nn.Parameter(
+            torch.FloatTensor(cfg.embedding_dim).uniform_()
+        )
 
         # dropout for features/spectrograms (applied before masking)
         self.dropout_features = (
@@ -224,13 +251,13 @@ class SpeechEncDecSelfSupervisedModel(ModelPT, ASRModuleMixin):
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
         return {
             "spectrograms": NeuralType(('B', 'D', 'T'), SpectrogramType()),
-            "spec_masks": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+            "spec_masks": NeuralType(('B', 'T'), SpectrogramType()),
             "outputs": NeuralType(('B', 'T', 'D'), VoidType()),
         }
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, mask=True
     ):
         """
         Forward pass of the model.
@@ -274,23 +301,56 @@ class SpeechEncDecSelfSupervisedModel(ModelPT, ASRModuleMixin):
         if self.dropout_features_q:
             spectrograms = self.dropout_features_q(spectrograms)
 
-        processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+        # B C T -> B T C
+        processed_signal = processed_signal.transpose(1, 2)
 
-        masked_spectrograms = processed_signal.detach()
-        spec_masks = torch.logical_and(masked_spectrograms < 1e-5, masked_spectrograms > -1e-5).float()
-        for idx, proc_len in enumerate(processed_signal_length):
-            spec_masks[idx, :, proc_len:] = 0.0
+        padding_mask = make_pad_mask(processed_signal_length)
+        if mask:
+            processed_signal, mask_indices = self.apply_mask(processed_signal, padding_mask)
+        
+        # B T C -> B C T
+        processed_signal = processed_signal.transpose(1, 2)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         outputs = self.decoder_ssl(encoder_output=encoded)
+        # processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+        # #padding_mask = torch.full(input_signal.shape, False).to(input_signal_length.device)
 
-        return spectrograms, spec_masks, outputs
+
+        # masked_spectrograms = processed_signal.detach()
+        # spec_masks = torch.logical_and(masked_spectrograms < 1e-5, masked_spectrograms > -1e-5).float()
+        # for idx, proc_len in enumerate(processed_signal_length):
+        #     spec_masks[idx, :, proc_len:] = 0.0
+
+        # encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        # outputs = self.decoder_ssl(encoder_output=encoded)
+        return spectrograms, mask_indices, outputs
+
+    def apply_mask(self, x, padding_mask):
+        B, T, C = x.shape
+        if self.mask_prob > 0:
+            mask_indices = compute_mask_indices(
+                (B, T),
+                padding_mask,
+                self.mask_prob,
+                self.mask_length,
+                self.mask_selection,
+                self.mask_other,
+                min_masks=2,
+                no_overlap=self.no_mask_overlap,
+                min_space=self.mask_min_space,
+            )
+            mask_indices = torch.from_numpy(mask_indices).to(x.device)
+            x[mask_indices] = self.mask_emb
+        else:
+            mask_indices = None
+
+        return x, mask_indices
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
         signal, signal_len, transcript, transcript_len = batch
         spectrograms, spec_masks, outputs = self.forward(input_signal=signal, input_signal_length=signal_len)
-
         self.loss.set_num_updates(self.trainer.global_step)
         loss_value = self.loss(spectrograms=spectrograms, spec_masks=spec_masks, decoder_outputs=outputs)
         if self.feat_pen:
@@ -314,3 +374,132 @@ class SpeechEncDecSelfSupervisedModel(ModelPT, ASRModuleMixin):
         val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
         tensorboard_logs = {'val_loss': val_loss_mean}
         return {'val_loss': val_loss_mean, 'log': tensorboard_logs}
+
+
+# Copied from fairseq.data.data_utils
+def compute_mask_indices(
+    shape: Tuple[int, int],
+    padding_mask: Optional[torch.Tensor],
+    mask_prob: float,
+    mask_length: int,
+    mask_type: str = "static",
+    mask_other: float = 0.0,
+    min_masks: int = 0,
+    no_overlap: bool = False,
+    min_space: int = 0,
+) -> np.ndarray:
+    """
+    Computes random mask spans for a given shape
+
+    Args:
+        shape: the the shape for which to compute masks.
+            should be of size 2 where first element is batch size and 2nd is timesteps
+        padding_mask: optional padding mask of the same size as shape, which will prevent masking padded elements
+        mask_prob: probability for each token to be chosen as start of the span to be masked. this will be multiplied by
+            number of timesteps divided by length of mask span to mask approximately this percentage of all elements.
+            however due to overlaps, the actual number will be smaller (unless no_overlap is True)
+        mask_type: how to compute mask lengths
+            static = fixed size
+            uniform = sample from uniform distribution [mask_other, mask_length*2]
+            normal = sample from normal distribution with mean mask_length and stdev mask_other. mask is min 1 element
+            poisson = sample from possion distribution with lambda = mask length
+        min_masks: minimum number of masked spans
+        no_overlap: if false, will switch to an alternative recursive algorithm that prevents spans from overlapping
+        min_space: only used if no_overlap is True, this is how many elements to keep unmasked between spans
+    """
+
+    bsz, all_sz = shape
+    mask = np.full((bsz, all_sz), False)
+
+    all_num_mask = int(
+        # add a random number for probabilistic rounding
+        mask_prob * all_sz / float(mask_length)
+        + np.random.rand()
+    )
+
+    all_num_mask = max(min_masks, all_num_mask)
+
+    mask_idcs = []
+    for i in range(bsz):
+        if padding_mask is not None:
+            sz = all_sz - padding_mask[i].long().sum().item()
+            num_mask = int(
+                # add a random number for probabilistic rounding
+                mask_prob * sz / float(mask_length)
+                + np.random.rand()
+            )
+            num_mask = max(min_masks, num_mask)
+        else:
+            sz = all_sz
+            num_mask = all_num_mask
+
+        if mask_type == "static":
+            lengths = np.full(num_mask, mask_length)
+        elif mask_type == "uniform":
+            lengths = np.random.randint(mask_other, mask_length * 2 + 1, size=num_mask)
+        elif mask_type == "normal":
+            lengths = np.random.normal(mask_length, mask_other, size=num_mask)
+            lengths = [max(1, int(round(x))) for x in lengths]
+        elif mask_type == "poisson":
+            lengths = np.random.poisson(mask_length, size=num_mask)
+            lengths = [int(round(x)) for x in lengths]
+        else:
+            raise Exception("unknown mask selection " + mask_type)
+
+        if sum(lengths) == 0:
+            lengths[0] = min(mask_length, sz - 1)
+
+        if no_overlap:
+            mask_idc = []
+
+            def arrange(s, e, length, keep_length):
+                span_start = np.random.randint(s, e - length)
+                mask_idc.extend(span_start + i for i in range(length))
+
+                new_parts = []
+                if span_start - s - min_space >= keep_length:
+                    new_parts.append((s, span_start - min_space + 1))
+                if e - span_start - keep_length - min_space > keep_length:
+                    new_parts.append((span_start + length + min_space, e))
+                return new_parts
+
+            parts = [(0, sz)]
+            min_length = min(lengths)
+            for length in sorted(lengths, reverse=True):
+                lens = np.fromiter(
+                    (e - s if e - s >= length + min_space else 0 for s, e in parts),
+                    np.int,
+                )
+                l_sum = np.sum(lens)
+                if l_sum == 0:
+                    break
+                probs = lens / np.sum(lens)
+                c = np.random.choice(len(parts), p=probs)
+                s, e = parts.pop(c)
+                parts.extend(arrange(s, e, length, min_length))
+            mask_idc = np.asarray(mask_idc)
+        else:
+            min_len = min(lengths)
+            if sz - min_len <= num_mask:
+                min_len = sz - num_mask - 1
+
+            mask_idc = np.random.choice(sz - min_len, num_mask, replace=False)
+
+            mask_idc = np.asarray(
+                [
+                    mask_idc[j] + offset
+                    for j in range(len(mask_idc))
+                    for offset in range(lengths[j])
+                ]
+            )
+
+        mask_idcs.append(np.unique(mask_idc[mask_idc < sz]))
+
+    min_len = min([len(m) for m in mask_idcs])
+    for i, mask_idc in enumerate(mask_idcs):
+        if len(mask_idc) > min_len:
+            mask_idc = np.random.choice(mask_idc, min_len, replace=False)
+        mask[i, mask_idc] = True
+
+    return mask
+    

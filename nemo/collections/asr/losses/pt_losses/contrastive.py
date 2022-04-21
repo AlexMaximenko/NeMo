@@ -30,7 +30,7 @@ class ContrastiveLoss(Loss):
         """
         return {
             "spectrograms": NeuralType(("B", "D", "T"), SpectrogramType()),
-            "spec_masks": NeuralType(("B", "D", "T"), SpectrogramType()),
+            "spec_masks": NeuralType(("B", "T"), SpectrogramType()),
             "decoder_outputs": NeuralType(("B", "T", "D"), VoidType()),
         }
 
@@ -52,7 +52,7 @@ class ContrastiveLoss(Loss):
         codebook_size: int = 320,
         prob_ppl_weight: float = 0.1,
         logit_temp: float = 0.1,
-        reduce: str = "sum",
+        reduce: str = "mean",
         sample_from_same_utterance_only: bool = True,
         sample_from_non_masked: bool = False,
         sample_from_codebook: bool = False,
@@ -134,12 +134,10 @@ class ContrastiveLoss(Loss):
     @typecheck()
     def forward(self, spectrograms, spec_masks, decoder_outputs):
         spec_in = spectrograms.transpose(-2, -1)
-        masks = spec_masks.transpose(-2, -1)
         targets = spec_in
         # BxTxC
 
         targets = targets.reshape(targets.shape[0], targets.shape[1] // self.combine_time_steps, -1)
-        masks = masks.reshape(targets.shape[0], targets.shape[1], -1)
 
         if self.quantized_targets:
             targets, prob_ppl_loss, cur_codebook_temp = self.quantizer(targets)
@@ -148,9 +146,8 @@ class ContrastiveLoss(Loss):
 
         if self.sample_from_same_utterance_only:
             bs = decoder_outputs.shape[0]
-            masks = masks.mean(-1) > self.mask_threshold
-            out_masked_only = decoder_outputs[masks]
-            targets_masked_only = targets[masks]
+            out_masked_only = decoder_outputs[spec_masks]
+            targets_masked_only = targets[spec_masks]
             out_masked_only = out_masked_only.reshape(bs, -1, out_masked_only.shape[-1])
             targets_masked_only = targets_masked_only.reshape(bs, -1, targets_masked_only.shape[-1])
 
@@ -179,9 +176,8 @@ class ContrastiveLoss(Loss):
             # T'BxC and NxT'BxC
 
         else:
-            masks = masks.mean(-1) > self.mask_threshold
-            out_masked_only = decoder_outputs[masks]
-            targets_masked_only = targets[masks]
+            out_masked_only = decoder_outputs[spec_masks]
+            targets_masked_only = targets[spec_masks]
 
             # T'xC
             # number of masked time steps to predict (T')
